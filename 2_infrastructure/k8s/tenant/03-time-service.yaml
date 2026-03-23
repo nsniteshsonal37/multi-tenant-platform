@@ -1,0 +1,123 @@
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tenant-quota
+  namespace: tenant-TENANT_ID
+spec:
+  hard:
+    requests.cpu: "2"
+    requests.memory: 2Gi
+    limits.cpu: "4"
+    limits.memory: 4Gi
+    pods: "20"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: time-service-config
+  namespace: tenant-TENANT_ID
+data:
+  TENANT_ID: TENANT_ID
+  SERVICE_NAME: time-service
+  POSTGRES_HOST: RDS_ENDPOINT
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: dbmaster
+  POSTGRES_DB: tenant_TENANT_ID_NORMALIZED  # replace hyphens with underscores
+  REDIS_HOST: redis.tenant-TENANT_ID.svc.cluster.local
+  REDIS_PORT: "6379"
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector.observability.svc.cluster.local:4317
+---
+# Secret: created by Terraform tenant module (sourced from AWS Secrets Manager)
+# For manual apply, create this secret before deploying the application:
+#   kubectl create secret generic time-service-secret \
+#     --namespace=tenant-TENANT_ID \
+#     --from-literal=POSTGRES_PASSWORD=<password> \
+#     --from-literal=JWT_SECRET=<jwt_secret>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: time-service
+  namespace: tenant-TENANT_ID
+  labels:
+    app: time-service
+    hrs/tenant-id: TENANT_ID
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: time-service
+  template:
+    metadata:
+      labels:
+        app: time-service
+        hrs/tenant-id: TENANT_ID
+    spec:
+      serviceAccountName: time-service
+      containers:
+        - name: time-service
+          image: ACCOUNT.dkr.ecr.eu-central-1.amazonaws.com/hrs-platform/time-service:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: time-service-config
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: time-service-secret
+                  key: POSTGRES_PASSWORD
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: time-service-secret
+                  key: JWT_SECRET
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: time-service
+  namespace: tenant-TENANT_ID
+spec:
+  selector:
+    app: time-service
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: time-service-hpa
+  namespace: tenant-TENANT_ID
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: time-service
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

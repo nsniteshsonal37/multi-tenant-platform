@@ -1,0 +1,56 @@
+---
+# Default deny all traffic in tenant namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: tenant-TENANT_ID
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  egress:
+    # Allow DNS
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow RDS PostgreSQL
+    - ports:
+        - protocol: TCP
+          port: 5432
+    # Allow Redis
+    - ports:
+        - protocol: TCP
+          port: 6379
+    # Allow OTLP to observability namespace
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - protocol: TCP
+          port: 4317
+---
+# Allow inbound from platform namespace only (gateway → time-service)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-platform
+  namespace: tenant-TENANT_ID
+spec:
+  podSelector:
+    matchLabels:
+      app: time-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: platform
+      ports:
+        - protocol: TCP
+          port: 8080

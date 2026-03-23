@@ -1,0 +1,30 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: time-service
+  namespace: tenant-TENANT_ID
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: time-service-role
+  namespace: tenant-TENANT_ID
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: time-service-rolebinding
+  namespace: tenant-TENANT_ID
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: time-service-role
+subjects:
+  - kind: ServiceAccount
+    name: time-service
+    namespace: tenant-TENANT_ID

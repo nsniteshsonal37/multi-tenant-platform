@@ -1,0 +1,244 @@
+// Pipeline 2: Tenant Provision
+// Provisions one or more new tenants in a single run.
+//
+// Input: TENANT_IDS — comma-separated list of tenant IDs to add (e.g. "acme,beta,contoso")
+//
+// For each new tenant_id the pipeline:
+//   1. Reads the currently provisioned tenant list from Terraform state
+//   2. Merges the new IDs with existing ones (idempotent)
+//   3. Runs terraform apply — Terraform creates namespace, time-service, DB, registry row
+//   4. Waits for rollout and runs a smoke test via the gateway
+//
+// Requires postgresql-client in the agent image for DB init operations by Terraform.
+
+pipeline {
+    agent {
+        kubernetes {
+            label 'jenkins-agent-tenant'
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins
+  containers:
+    - name: tools
+      image: alpine:3.19
+      command: [sleep, infinity]
+      env:
+        - name: AWS_DEFAULT_REGION
+          value: eu-central-1
+"""
+        }
+    }
+
+    parameters {
+        string(
+            name: 'TENANT_IDS',
+            defaultValue: '',
+            description: 'Comma-separated list of tenant IDs to provision (e.g. acme,beta,contoso)'
+        )
+    }
+
+    environment {
+        AWS_REGION   = 'eu-central-1'
+        CLUSTER_NAME = 'hrs-platform'
+        TF_DIR       = 'DevOps/HRS-Assessment/2_infrastructure/terraform'
+        TF_VARS_FILE = '/var/jenkins_home/terraform.tfvars'
+    }
+
+    stages {
+        stage('Validate Input') {
+            steps {
+                script {
+                    if (!params.TENANT_IDS?.trim()) {
+                        error("TENANT_IDS parameter is required. Provide a comma-separated list.")
+                    }
+                    env.NEW_TENANTS = params.TENANT_IDS.trim()
+                    echo "New tenants to provision: ${env.NEW_TENANTS}"
+                }
+            }
+        }
+
+        stage('Install Tools') {
+            steps {
+                container('tools') {
+                    sh '''
+                        apk add --no-cache \
+                            aws-cli \
+                            kubectl \
+                            curl \
+                            bash \
+                            jq \
+                            python3 \
+                            postgresql-client
+                        TERRAFORM_VERSION=1.7.5
+                        wget -q https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+                        unzip -q terraform_${TERRAFORM_VERSION}_linux_amd64.zip -d /usr/local/bin/
+                        terraform version
+                    '''
+                }
+            }
+        }
+
+        stage('Configure AWS + kubectl') {
+            steps {
+                container('tools') {
+                    withCredentials([usernamePassword(
+                        credentialsId: 'aws-credentials',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )]) {
+                        sh '''
+                            aws eks update-kubeconfig \
+                                --region $AWS_REGION \
+                                --name $CLUSTER_NAME
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Resolve Full Tenant List') {
+            steps {
+                container('tools') {
+                    withCredentials([usernamePassword(
+                        credentialsId: 'aws-credentials',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )]) {
+                        script {
+                            def tfDir = env.TF_DIR
+                            def rawOutput = sh(
+                                script: "cd ${tfDir} && terraform output -json tenant_ids 2>/dev/null || echo '[]'",
+                                returnStdout: true
+                            ).trim()
+
+                            def existing = []
+                            try {
+                                existing = readJSON(text: rawOutput)
+                            } catch (e) {
+                                echo "Could not parse existing tenant_ids — starting fresh"
+                            }
+
+                            def incoming = env.NEW_TENANTS.split(',').collect { it.trim() }.findAll { it }
+                            def allTenants = (existing + incoming).unique().sort()
+
+                            env.ALL_TENANT_IDS_JSON = groovy.json.JsonOutput.toJson(allTenants)
+                            env.ALL_TENANT_IDS_LIST = allTenants.join(', ')
+
+                            echo "Existing tenants:  ${existing.join(', ') ?: '(none)'}"
+                            echo "New tenants:       ${incoming.join(', ')}"
+                            echo "Final tenant list: ${env.ALL_TENANT_IDS_LIST}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Init') {
+            steps {
+                container('tools') {
+                    withCredentials([usernamePassword(
+                        credentialsId: 'aws-credentials',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )]) {
+                        sh '''
+                            cd ${TF_DIR}
+                            terraform init -input=false
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Plan') {
+            steps {
+                container('tools') {
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'aws-credentials',
+                            usernameVariable: 'AWS_ACCESS_KEY_ID',
+                            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                        ),
+                        file(credentialsId: 'terraform-tfvars', variable: 'TFVARS_PATH')
+                    ]) {
+                        sh '''
+                            cd ${TF_DIR}
+                            terraform plan \
+                                -input=false \
+                                -var-file="${TFVARS_PATH}" \
+                                -var="tenant_ids=${ALL_TENANT_IDS_JSON}" \
+                                -out=tfplan
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Apply') {
+            steps {
+                container('tools') {
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'aws-credentials',
+                            usernameVariable: 'AWS_ACCESS_KEY_ID',
+                            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                        ),
+                        file(credentialsId: 'terraform-tfvars', variable: 'TFVARS_PATH')
+                    ]) {
+                        sh '''
+                            cd ${TF_DIR}
+                            terraform apply -input=false -auto-approve tfplan
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Wait for Rollouts') {
+            steps {
+                container('tools') {
+                    script {
+                        def tenants = env.NEW_TENANTS.split(',').collect { it.trim() }.findAll { it }
+                        tenants.each { tenant ->
+                            sh """
+                                echo "Waiting for time-service in namespace tenant-${tenant}..."
+                                kubectl rollout status deployment/time-service \
+                                    -n tenant-${tenant} \
+                                    --timeout=120s
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Smoke Test') {
+            steps {
+                container('tools') {
+                    script {
+                        def tenants = env.NEW_TENANTS.split(',').collect { it.trim() }.findAll { it }
+                        tenants.each { tenant ->
+                            sh """
+                                echo "=== Smoke test for tenant: ${tenant} ==="
+                                TS_POD=\$(kubectl get pod -n tenant-${tenant} -l app=time-service -o jsonpath="{.items[0].metadata.name}")
+                                kubectl exec -n tenant-${tenant} \$TS_POD -- wget -qO- http://localhost:8080/health
+                                echo "time-service health OK for tenant: ${tenant}"
+                            """
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Tenant provisioning complete: ${env.ALL_TENANT_IDS_LIST}"
+        }
+        failure {
+            echo "Tenant provisioning FAILED for: ${env.NEW_TENANTS}"
+        }
+    }
+}
