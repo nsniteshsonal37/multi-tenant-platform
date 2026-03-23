@@ -1,0 +1,45 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1000
+
+  # Inject cluster-level attributes on all telemetry
+  resource/add_cluster:
+    attributes:
+      - key: service.cluster
+        value: hrs-platform
+        action: insert
+      - key: deployment.environment
+        value: ${ENVIRONMENT}
+        action: insert
+
+exporters:
+  # New Relic EU OTLP endpoint — change to otlp.nr-data.net for US accounts
+  otlp/newrelic:
+    endpoint: https://otlp.eu01.nr-data.net:4317
+    headers:
+      api-key: ${NEW_RELIC_LICENSE_KEY}
+    compression: gzip
+
+service:
+  pipelines:
+    traces:
+      receivers:  [otlp]
+      processors: [resource/add_cluster, batch]
+      exporters:  [otlp/newrelic]
+    metrics:
+      receivers:  [otlp]
+      processors: [resource/add_cluster, batch]
+      exporters:  [otlp/newrelic]
+    logs:
+      receivers:  [otlp]
+      processors: [resource/add_cluster, batch]
+      exporters:  [otlp/newrelic]
